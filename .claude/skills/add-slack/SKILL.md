@@ -120,13 +120,15 @@ Wait for the user to provide the channel ID.
 
 The channel ID, name, and folder name are needed. Use `npx tsx setup/index.ts --step register` with the appropriate flags.
 
-For a main channel (responds to all messages):
+**Important: shared channels with other bots.** If the channel has other bots (e.g. another AI assistant), do NOT use `--no-trigger-required`. Register with trigger required so NanoClaw only responds to `@<trigger>` mentions, not every message in the channel. Each Slack app must also use its own tokens — Socket Mode only allows one active connection per app.
+
+For a main channel (responds to all messages, **only use if NanoClaw is the sole bot**):
 
 ```bash
 npx tsx setup/index.ts --step register -- --jid "slack:<channel-id>" --name "<channel-name>" --folder "slack_main" --trigger "@${ASSISTANT_NAME}" --channel slack --no-trigger-required --is-main
 ```
 
-For additional channels (trigger-only):
+For channels shared with other bots, or additional channels (trigger-only):
 
 ```bash
 npx tsx setup/index.ts --step register -- --jid "slack:<channel-id>" --name "<channel-name>" --folder "slack_<channel-name>" --trigger "@${ASSISTANT_NAME}" --channel slack
@@ -158,6 +160,16 @@ tail -f logs/nanoclaw.log
 2. Check channel is registered: `sqlite3 store/messages.db "SELECT * FROM registered_groups WHERE jid LIKE 'slack:%'"`
 3. For non-main channels: message must include trigger pattern
 4. Service is running: `launchctl list | grep nanoclaw`
+
+### Bot responds to messages meant for other bots
+
+If the channel is shared with other bots and NanoClaw is registered with `--no-trigger-required` (or as main), it will respond to every message — including those directed at other bots. Fix by requiring the trigger:
+
+```bash
+sqlite3 store/messages.db "UPDATE registered_groups SET requires_trigger = 1 WHERE jid = 'slack:<channel-id>';"
+```
+
+Then restart the service. The bot will now only respond to `@<trigger>` mentions.
 
 ### Bot connected but not receiving messages
 
@@ -197,10 +209,32 @@ The Slack channel supports:
 - **Direct messages** — Users can DM the bot directly
 - **Multi-channel** — Can run alongside WhatsApp or other channels (auto-enabled by credentials)
 
+## Thread-Aware Replies
+
+By default, the bot replies in the same context as the incoming message:
+- **Threaded reply** → bot responds in the same thread
+- **Channel root message** → bot responds in the channel
+
+Set `SLACK_ALWAYS_REPLY_IN_THREAD=true` in `.env` to force all channel replies into threads:
+- **Channel root message** → bot starts a new thread on that message
+- **Threaded reply** → bot responds in the same thread
+- **DMs** → always reply directly (threading DMs hides them in Slack's UI)
+
+Based on upstream PR qwibitai/nanoclaw#682.
+
+## Shimmer Typing Indicator
+
+The bot can show a "thinking" shimmer in Slack while processing. To enable:
+
+1. Go to your Slack app settings → **Features** → **Agents & AI Apps** → enable
+2. This grants the `assistant:write` scope needed for `assistant.threads.setStatus`
+3. Reinstall the app to your workspace if prompted
+
+If not configured, the feature silently no-ops. Based on upstream PR qwibitai/nanoclaw#653.
+
 ## Known Limitations
 
-- **Threads are flattened** — Threaded replies are delivered to the agent as regular channel messages. The agent sees them but has no awareness they originated in a thread. Responses always go to the channel, not back into the thread. Users in a thread will need to check the main channel for the bot's reply. Full thread-aware routing (respond in-thread) requires pipeline-wide changes: database schema, `NewMessage` type, `Channel.sendMessage` interface, and routing logic.
-- **No typing indicator** — Slack's Bot API does not expose a typing indicator endpoint. The `setTyping()` method is a no-op. Users won't see "bot is typing..." while the agent works.
+- **Multi-thread batching** — If multiple `@trigger` messages arrive from different threads in the same processing window, only the last thread gets a reply. See qwibitai/nanoclaw#1568.
 - **Message splitting is naive** — Long messages are split at a fixed 4000-character boundary, which may break mid-word or mid-sentence. A smarter split (on paragraph or sentence boundaries) would improve readability.
 - **No file/image handling** — The bot only processes text content. File uploads, images, and rich message blocks are not forwarded to the agent.
 - **Channel metadata sync is unbounded** — `syncChannelMetadata()` paginates through all channels the bot is a member of, but has no upper bound or timeout. Workspaces with thousands of channels may experience slow startup.

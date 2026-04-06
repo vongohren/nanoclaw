@@ -39,6 +39,30 @@ grep -E "image found|image NOT found|image missing" logs/nanoclaw.log
 
 If you need Kubernetes enabled, set `CONTAINER_IMAGE` to an image stored in a registry that the kubelet won't GC, or raise the GC thresholds.
 
+### 5. OneCLI gateway unreachable from Docker containers (WSL/Linux)
+
+**Symptoms**: Container logs show endless `system/api_retry` messages. The agent initializes but never gets an API response.
+
+**Cause**: OneCLI binds to `127.0.0.1` by default. Docker containers connect via `host.docker.internal`, which resolves to the Docker bridge IP (e.g., `172.17.0.1`) — not `127.0.0.1`. The gateway port is unreachable.
+
+**Fix**: Bind OneCLI to all interfaces:
+```bash
+echo 'ONECLI_BIND_HOST=0.0.0.0' > ~/.onecli/.env
+docker compose -p onecli -f ~/.onecli/docker-compose.yml up -d
+```
+
+**Diagnosis**:
+```bash
+# Check what address the gateway listens on
+ss -tlnp | grep 10255
+# Bad:  127.0.0.1:10255
+# Good: 0.0.0.0:10255
+
+# Test from inside a running container
+docker exec <container-id> sh -c "curl -s -o /dev/null -w '%{http_code}' --proxy '' http://host.docker.internal:10255/"
+# Should return a non-000 status code
+```
+
 ## Quick Status Check
 
 ```bash

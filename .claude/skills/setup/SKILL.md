@@ -172,6 +172,15 @@ Ensure `.env` has the OneCLI URL (create the file if it doesn't exist):
 grep -q 'ONECLI_URL' .env 2>/dev/null || echo 'ONECLI_URL=${ONECLI_URL}' >> .env
 ```
 
+**WSL/Linux Docker networking fix:** OneCLI binds to `127.0.0.1` by default, which is unreachable from Docker containers. The agent container connects via `host.docker.internal`, which routes to the host's Docker bridge IP — not `127.0.0.1`. Fix by setting `ONECLI_BIND_HOST=0.0.0.0`:
+
+```bash
+echo 'ONECLI_BIND_HOST=0.0.0.0' > ~/.onecli/.env
+docker compose -p onecli -f ~/.onecli/docker-compose.yml up -d
+```
+
+Verify the gateway is reachable: `ss -tlnp | grep 10255` should show `0.0.0.0:10255`.
+
 Check if a secret already exists:
 ```bash
 onecli secrets list
@@ -326,9 +335,13 @@ Tell user to test: send a message in their registered chat. Show: `tail -f logs/
 
 **Service not starting:** Check `logs/nanoclaw.error.log`. Common: wrong Node path (re-run step 7), credential system not running (Docker: check `curl ${ONECLI_URL}/api/health`; Apple Container: check `.env` credentials), missing channel credentials (re-invoke channel skill).
 
+**Container agent keeps retrying API calls (`system/api_retry` in container logs):** The agent container can't reach the OneCLI gateway. On WSL/Linux, OneCLI binds to `127.0.0.1` by default, which isn't reachable from Docker containers. Fix: `echo 'ONECLI_BIND_HOST=0.0.0.0' > ~/.onecli/.env && docker compose -p onecli -f ~/.onecli/docker-compose.yml up -d`. Verify with `ss -tlnp | grep 10255` — it should show `0.0.0.0:10255`, not `127.0.0.1:10255`.
+
 **Container agent fails ("Claude Code process exited with code 1"):** Ensure the container runtime is running — `open -a Docker` (macOS Docker), `container system start` (Apple Container), or `sudo systemctl start docker` (Linux). Check container logs in `groups/main/logs/container-*.log`.
 
 **No response to messages:** Check trigger pattern. Main channel doesn't need prefix. Check DB: `npx tsx setup/index.ts --step verify`. Check `logs/nanoclaw.log`.
+
+**Bot responds to messages meant for other bots (Slack):** If the channel is shared with other bots, the NanoClaw chat must be registered with `requires_trigger = true` so it only responds to `@<trigger>` mentions. Fix: `sqlite3 store/messages.db "UPDATE registered_groups SET requires_trigger = 1 WHERE jid = 'slack:<channel-id>';"` and restart the service.
 
 **Channel not connecting:** Verify the channel's credentials are set in `.env`. Channels auto-enable when their credentials are present. For WhatsApp: check `store/auth/creds.json` exists. For token-based channels: check token values in `.env`. Restart the service after any `.env` change.
 

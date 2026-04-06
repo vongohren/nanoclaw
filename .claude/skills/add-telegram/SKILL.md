@@ -123,6 +123,14 @@ launchctl kickstart -k gui/$(id -u)/com.nanoclaw  # macOS
 
 ### Get Chat ID
 
+**Important:** The `/chatid` command is handled by NanoClaw, not by Telegram itself. The service must be running for the bot to respond. If it's not running yet (first-time setup), start it temporarily:
+
+```bash
+timeout 120 npx tsx src/index.ts &
+```
+
+This starts NanoClaw in the background for 2 minutes — enough time to get the chat ID. It will auto-stop after the timeout.
+
 Tell the user:
 
 > 1. Open your bot in Telegram (search for its username)

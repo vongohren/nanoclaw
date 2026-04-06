@@ -34,7 +34,11 @@ export class SlackChannel implements Channel {
   private app: App;
   private botUserId: string | undefined;
   private connected = false;
-  private outgoingQueue: Array<{ jid: string; text: string; threadTs?: string }> = [];
+  private outgoingQueue: Array<{
+    jid: string;
+    text: string;
+    threadTs?: string;
+  }> = [];
   private flushing = false;
   private userNameCache = new Map<string, string>();
   // Track latest user message ts per channel for assistant.threads.setStatus
@@ -55,11 +59,16 @@ export class SlackChannel implements Channel {
 
     // Read tokens from .env (not process.env — keeps secrets off the environment
     // so they don't leak to child processes, matching NanoClaw's security pattern)
-    const env = readEnvFile(['SLACK_BOT_TOKEN', 'SLACK_APP_TOKEN', 'SLACK_ALWAYS_REPLY_IN_THREAD']);
+    const env = readEnvFile([
+      'SLACK_BOT_TOKEN',
+      'SLACK_APP_TOKEN',
+      'SLACK_ALWAYS_REPLY_IN_THREAD',
+    ]);
     const botToken = env.SLACK_BOT_TOKEN;
     const appToken = env.SLACK_APP_TOKEN;
     this.alwaysReplyInThread =
-      (process.env.SLACK_ALWAYS_REPLY_IN_THREAD ?? env.SLACK_ALWAYS_REPLY_IN_THREAD) === 'true';
+      (process.env.SLACK_ALWAYS_REPLY_IN_THREAD ??
+        env.SLACK_ALWAYS_REPLY_IN_THREAD) === 'true';
 
     if (!botToken || !appToken) {
       throw new Error(
@@ -109,9 +118,7 @@ export class SlackChannel implements Channel {
         senderName = ASSISTANT_NAME;
       } else {
         senderName =
-          (await this.resolveUserName(msg.user ?? '')) ||
-          msg.user ||
-          'unknown';
+          (await this.resolveUserName(msg.user ?? '')) || msg.user || 'unknown';
       }
 
       // Translate Slack <@UBOTID> mentions into TRIGGER_PATTERN format.
