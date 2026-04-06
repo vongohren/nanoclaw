@@ -34,9 +34,19 @@ export class SlackChannel implements Channel {
   private app: App;
   private botUserId: string | undefined;
   private connected = false;
-  private outgoingQueue: Array<{ jid: string; text: string }> = [];
+  private outgoingQueue: Array<{ jid: string; text: string; threadTs?: string }> = [];
   private flushing = false;
   private userNameCache = new Map<string, string>();
+  // Track latest user message ts per channel for assistant.threads.setStatus
+  private lastUserMessageTs = new Map<string, string>();
+  // Track the thread_ts used for the active typing indicator per channel
+  private activeTypingTs = new Map<string, string>();
+  // Tracks the thread_ts to reply into for each JID.
+  // Set when an incoming message is part of a thread, or when
+  // SLACK_ALWAYS_REPLY_IN_THREAD is enabled (uses the message ts).
+  // Consumed and cleared when sendMessage is called for that JID.
+  private pendingThreadTs = new Map<string, string>();
+  private alwaysReplyInThread: boolean;
 
   private opts: SlackChannelOpts;
 
@@ -45,9 +55,11 @@ export class SlackChannel implements Channel {
 
     // Read tokens from .env (not process.env — keeps secrets off the environment
     // so they don't leak to child processes, matching NanoClaw's security pattern)
-    const env = readEnvFile(['SLACK_BOT_TOKEN', 'SLACK_APP_TOKEN']);
+    const env = readEnvFile(['SLACK_BOT_TOKEN', 'SLACK_APP_TOKEN', 'SLACK_ALWAYS_REPLY_IN_THREAD']);
     const botToken = env.SLACK_BOT_TOKEN;
     const appToken = env.SLACK_APP_TOKEN;
+    this.alwaysReplyInThread =
+      (process.env.SLACK_ALWAYS_REPLY_IN_THREAD ?? env.SLACK_ALWAYS_REPLY_IN_THREAD) === 'true';
 
     if (!botToken || !appToken) {
       throw new Error(
@@ -79,10 +91,6 @@ export class SlackChannel implements Channel {
 
       if (!msg.text) return;
 
-      // Threaded replies are flattened into the channel conversation.
-      // The agent sees them alongside channel-level messages; responses
-      // always go to the channel, not back into the thread.
-
       const jid = `slack:${msg.channel}`;
       const timestamp = new Date(parseFloat(msg.ts) * 1000).toISOString();
       const isGroup = msg.channel_type !== 'im';
@@ -94,15 +102,14 @@ export class SlackChannel implements Channel {
       const groups = this.opts.registeredGroups();
       if (!groups[jid]) return;
 
-      const isBotMessage =
-        !!msg.bot_id || msg.user === this.botUserId;
+      const isBotMessage = !!msg.bot_id || msg.user === this.botUserId;
 
       let senderName: string;
       if (isBotMessage) {
         senderName = ASSISTANT_NAME;
       } else {
         senderName =
-          (msg.user ? await this.resolveUserName(msg.user) : undefined) ||
+          (await this.resolveUserName(msg.user ?? '')) ||
           msg.user ||
           'unknown';
       }
@@ -113,9 +120,37 @@ export class SlackChannel implements Channel {
       let content = msg.text;
       if (this.botUserId && !isBotMessage) {
         const mentionPattern = `<@${this.botUserId}>`;
-        if (content.includes(mentionPattern) && !TRIGGER_PATTERN.test(content)) {
+        if (
+          content.includes(mentionPattern) &&
+          !TRIGGER_PATTERN.test(content)
+        ) {
           content = `@${ASSISTANT_NAME} ${content}`;
         }
+      }
+
+      // Track thread context so replies go back into the same thread.
+      // thread_ts is present on all messages in a thread (including the root).
+      // A message is a threaded reply when thread_ts differs from its own ts.
+      if (!isBotMessage) {
+        const threadTs = (msg as GenericMessageEvent).thread_ts;
+        if (threadTs && threadTs !== msg.ts) {
+          // Threaded reply — respond in the same thread
+          this.pendingThreadTs.set(jid, threadTs);
+        } else if (this.alwaysReplyInThread && isGroup) {
+          // Root channel message, always-in-thread mode — start a new thread.
+          // Not applied to DMs: threading a DM reply hides it in Slack's thread panel.
+          this.pendingThreadTs.set(jid, msg.ts);
+        } else {
+          // Root channel message — respond in channel
+          this.pendingThreadTs.delete(jid);
+        }
+      }
+
+      // Track last user message ts for typing indicator (assistant.threads.setStatus).
+      // For threaded replies, use thread_ts (the thread root) since the API targets threads.
+      if (!isBotMessage) {
+        const threadRoot = (msg as { thread_ts?: string }).thread_ts ?? msg.ts;
+        this.lastUserMessageTs.set(jid, threadRoot);
       }
 
       this.opts.onMessage(jid, {
@@ -142,10 +177,7 @@ export class SlackChannel implements Channel {
       this.botUserId = auth.user_id as string;
       logger.info({ botUserId: this.botUserId }, 'Connected to Slack');
     } catch (err) {
-      logger.warn(
-        { err },
-        'Connected to Slack but failed to get bot user ID',
-      );
+      logger.warn({ err }, 'Connected to Slack but failed to get bot user ID');
     }
 
     this.connected = true;
@@ -159,9 +191,11 @@ export class SlackChannel implements Channel {
 
   async sendMessage(jid: string, text: string): Promise<void> {
     const channelId = jid.replace(/^slack:/, '');
+    const threadTs = this.pendingThreadTs.get(jid);
+    this.pendingThreadTs.delete(jid);
 
     if (!this.connected) {
-      this.outgoingQueue.push({ jid, text });
+      this.outgoingQueue.push({ jid, text, threadTs });
       logger.info(
         { jid, queueSize: this.outgoingQueue.length },
         'Slack disconnected, message queued',
@@ -169,21 +203,25 @@ export class SlackChannel implements Channel {
       return;
     }
 
+    const post = (chunk: string) =>
+      this.app.client.chat.postMessage({
+        channel: channelId,
+        text: chunk,
+        ...(threadTs ? { thread_ts: threadTs } : {}),
+      });
+
     try {
       // Slack limits messages to ~4000 characters; split if needed
       if (text.length <= MAX_MESSAGE_LENGTH) {
-        await this.app.client.chat.postMessage({ channel: channelId, text });
+        await post(text);
       } else {
         for (let i = 0; i < text.length; i += MAX_MESSAGE_LENGTH) {
-          await this.app.client.chat.postMessage({
-            channel: channelId,
-            text: text.slice(i, i + MAX_MESSAGE_LENGTH),
-          });
+          await post(text.slice(i, i + MAX_MESSAGE_LENGTH));
         }
       }
-      logger.info({ jid, length: text.length }, 'Slack message sent');
+      logger.info({ jid, length: text.length, threadTs }, 'Slack message sent');
     } catch (err) {
-      this.outgoingQueue.push({ jid, text });
+      this.outgoingQueue.push({ jid, text, threadTs });
       logger.warn(
         { jid, err, queueSize: this.outgoingQueue.length },
         'Failed to send Slack message, queued',
@@ -204,11 +242,33 @@ export class SlackChannel implements Channel {
     await this.app.stop();
   }
 
-  // Slack does not expose a typing indicator API for bots.
-  // This no-op satisfies the Channel interface so the orchestrator
-  // doesn't need channel-specific branching.
-  async setTyping(_jid: string, _isTyping: boolean): Promise<void> {
-    // no-op: Slack Bot API has no typing indicator endpoint
+  // Use Slack's Agents & Assistants API to show a shimmer/typing indicator.
+  // Requires the assistant:write scope (enable "Agents & AI Apps" in app settings).
+  // Only works in DM threads; silently ignored elsewhere.
+  async setTyping(jid: string, isTyping: boolean): Promise<void> {
+    const channelId = jid.replace(/^slack:/, '');
+
+    let threadTs: string | undefined;
+    if (isTyping) {
+      // Pin the thread_ts at start so a new message arriving mid-processing
+      // won't cause setTyping(false) to clear a different thread.
+      threadTs = this.lastUserMessageTs.get(jid);
+      if (threadTs) this.activeTypingTs.set(jid, threadTs);
+    } else {
+      threadTs = this.activeTypingTs.get(jid);
+      this.activeTypingTs.delete(jid);
+    }
+    if (!threadTs) return;
+
+    try {
+      await this.app.client.assistant.threads.setStatus({
+        channel_id: channelId,
+        thread_ts: threadTs,
+        status: isTyping ? 'is thinking...' : '',
+      });
+    } catch {
+      // Silently ignore — requires assistant:write scope and only works in DM threads
+    }
   }
 
   /**
@@ -245,9 +305,7 @@ export class SlackChannel implements Channel {
     }
   }
 
-  private async resolveUserName(
-    userId: string,
-  ): Promise<string | undefined> {
+  private async resolveUserName(userId: string): Promise<string | undefined> {
     if (!userId) return undefined;
 
     const cached = this.userNameCache.get(userId);
@@ -278,6 +336,7 @@ export class SlackChannel implements Channel {
         await this.app.client.chat.postMessage({
           channel: channelId,
           text: item.text,
+          ...(item.threadTs ? { thread_ts: item.threadTs } : {}),
         });
         logger.info(
           { jid: item.jid, length: item.text.length },
